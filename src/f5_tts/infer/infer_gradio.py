@@ -40,6 +40,8 @@ from f5_tts.infer.utils_infer import (
     save_spectrogram,
 )
 
+from f5_tts.infer.speech_edit import prepare_edit
+import json
 
 DEFAULT_TTS_MODEL = "F5-TTS"
 tts_model_choice = DEFAULT_TTS_MODEL
@@ -175,6 +177,78 @@ def infer(
 
     return (final_sample_rate, final_wave), spectrogram_path, ref_text
 
+@gpu_decorator
+def edit_infer(
+    ref_audio_orig,
+    edit_text,
+    model,
+    remove_silence,
+    cross_fade_duration=0.15,
+    nfe_step=32,
+    edit_time_range=[],
+    fix_duration=[],
+    show_info=gr.Info,
+):
+    if not ref_audio_orig:
+        gr.Warning("Please provide reference audio.")
+        return gr.update(), gr.update(), edit_time_range, fix_duration
+
+    if not edit_text.strip():
+        gr.Warning("Please enter text to generate.")
+        return gr.update(), gr.update(), edit_time_range, fix_duration
+
+    if model == "F5-TTS":
+        ema_model = F5TTS_ema_model
+    elif model == "E2-TTS":
+        global E2TTS_ema_model
+        if E2TTS_ema_model is None:
+            show_info("Loading E2-TTS model...")
+            E2TTS_ema_model = load_e2tts()
+        ema_model = E2TTS_ema_model
+    elif isinstance(model, list) and model[0] == "Custom":
+        assert not USING_SPACES, "Only official checkpoints allowed in Spaces."
+        global custom_ema_model, pre_custom_path
+        if pre_custom_path != model[1]:
+            show_info("Loading Custom TTS model...")
+            custom_ema_model = load_custom(model[1], vocab_path=model[2], model_cfg=model[3])
+            pre_custom_path = model[1]
+        ema_model = custom_ema_model
+
+    try:
+        edit_time_range = json.loads(edit_time_range)
+    except json.JSONDecodeError:
+        edit_time_range = []
+    try:    
+        fix_duration = json.loads(fix_duration)
+    except json.JSONDecodeError:
+        fix_duration = []
+
+
+    final_wave, combined_spectrogram, final_sample_rate, parts_to_edit, fix_duration = prepare_edit(
+        ref_audio_orig,
+        edit_text,
+        ema_model,
+        vocoder,
+        cfg_strength=2.0,
+        nfe_step=nfe_step,
+        parts_to_edit = edit_time_range,
+        fix_duration = fix_duration,
+    )
+
+    # Remove silence
+    if remove_silence:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            sf.write(f.name, final_wave, final_sample_rate)
+            remove_silence_for_generated_wav(f.name)
+            final_wave, _ = torchaudio.load(f.name)
+        final_wave = final_wave.squeeze().cpu().numpy()
+
+    # Save the spectrogram
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_spectrogram:
+        spectrogram_path = tmp_spectrogram.name
+        save_spectrogram(combined_spectrogram, spectrogram_path)
+
+    return (final_sample_rate, final_wave), spectrogram_path, parts_to_edit, fix_duration
 
 with gr.Blocks() as app_credits:
     gr.Markdown("""
@@ -264,6 +338,89 @@ with gr.Blocks() as app_tts:
         outputs=[audio_output, spectrogram_output, ref_text_input],
     )
 
+with gr.Blocks() as app_edit:
+    gr.Markdown("# Speech Editing")
+    original_audio = gr.Audio(label="Original Audio", type="filepath")
+    with gr.Row():
+        ref_text_edit = gr.Textbox(label="Reference Text", lines=3)
+        get_ref_btn = gr.Button("Get Reference Text", variant="secondary")
+    edit_text = gr.Textbox(label="Text to Edit", lines=3)
+    edit_time_range = gr.Textbox(label="Edit Time Range", lines=1)
+    fix_duration = gr.Textbox(label="Fix Duration", lines=1)
+    edit_btn = gr.Button("Edit Audio", variant="primary")
+    with gr.Accordion("Advanced Settings", open=False):
+        remove_silence = gr.Checkbox(
+            label="Remove Silences",
+            info="The model tends to produce silences, especially on longer audio. We can manually remove silences if needed. Note that this is an experimental feature and may produce strange results. This will also increase generation time.",
+            value=False,
+        )
+        nfe_slider = gr.Slider(
+            label="NFE Steps",
+            minimum=4,
+            maximum=64,
+            value=32,
+            step=2,
+            info="Set the number of denoising steps.",
+        )
+        cross_fade_duration_slider = gr.Slider(
+            label="Cross-Fade Duration (s)",
+            minimum=0.0,
+            maximum=1.0,
+            value=0.15,
+            step=0.01,
+            info="Set the duration of the cross-fade between audio clips.",
+        )
+
+    audio_output = gr.Audio(label="Synthesized Audio")
+    spectrogram_output = gr.Image(label="Spectrogram")
+
+    @gpu_decorator
+    def get_ref_text(ref_audio_input):
+        ref_text = preprocess_ref_audio_text(ref_audio_input, "")[1]
+        return ref_text
+
+    @gpu_decorator
+    def edit_tts(
+        ref_audio_input,
+        edit_text,
+        remove_silence,
+        cross_fade_duration_slider,
+        nfe_slider,
+        edit_time_range_text,
+        fix_duration_text
+    ):
+        audio_out, spectrogram_path, parts_to_edit, fix_duration = edit_infer(
+            ref_audio_input,
+            edit_text,
+            tts_model_choice,
+            remove_silence,
+            cross_fade_duration=cross_fade_duration_slider,
+            nfe_step=nfe_slider,
+            edit_time_range=edit_time_range_text,
+            fix_duration=fix_duration_text,
+        )
+
+        return audio_out, spectrogram_path, parts_to_edit, fix_duration
+
+    edit_btn.click(
+        edit_tts,
+        inputs=[
+            original_audio,
+            edit_text,
+            remove_silence,
+            cross_fade_duration_slider,
+            nfe_slider,
+            edit_time_range,
+            fix_duration
+        ],
+        outputs=[audio_output, spectrogram_output, edit_time_range, fix_duration],
+    )
+
+    get_ref_btn.click(
+        get_ref_text,
+        inputs=[original_audio],
+        outputs=[ref_text_edit],
+    )
 
 def parse_speechtypes_text(gen_text):
     # Pattern to find {speechtype}
@@ -852,8 +1009,8 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
     )
 
     gr.TabbedInterface(
-        [app_tts, app_multistyle, app_chat, app_credits],
-        ["Basic-TTS", "Multi-Speech", "Voice-Chat", "Credits"],
+        [app_tts, app_edit, app_multistyle, app_chat, app_credits],
+        ["Basic-TTS","Speech-Edit", "Multi-Speech", "Voice-Chat", "Credits"],
     )
 
 
