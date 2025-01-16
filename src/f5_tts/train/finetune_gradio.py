@@ -62,7 +62,8 @@ def save_settings(
     epochs,
     num_warmup_updates,
     save_per_updates,
-    last_per_steps,
+    keep_last_n_checkpoints,
+    last_per_updates,
     finetune,
     file_checkpoint_train,
     tokenizer_type,
@@ -86,7 +87,8 @@ def save_settings(
         "epochs": epochs,
         "num_warmup_updates": num_warmup_updates,
         "save_per_updates": save_per_updates,
-        "last_per_steps": last_per_steps,
+        "keep_last_n_checkpoints": keep_last_n_checkpoints,
+        "last_per_updates": last_per_updates,
         "finetune": finetune,
         "file_checkpoint_train": file_checkpoint_train,
         "tokenizer_type": tokenizer_type,
@@ -118,7 +120,8 @@ def load_settings(project_name):
             "epochs": 100,
             "num_warmup_updates": 2,
             "save_per_updates": 300,
-            "last_per_steps": 100,
+            "keep_last_n_checkpoints": -1,
+            "last_per_updates": 100,
             "finetune": True,
             "file_checkpoint_train": "",
             "tokenizer_type": "pinyin",
@@ -127,53 +130,19 @@ def load_settings(project_name):
             "logger": "wandb",
             "bnb_optimizer": False,
         }
-        return (
-            settings["exp_name"],
-            settings["learning_rate"],
-            settings["batch_size_per_gpu"],
-            settings["batch_size_type"],
-            settings["max_samples"],
-            settings["grad_accumulation_steps"],
-            settings["max_grad_norm"],
-            settings["epochs"],
-            settings["num_warmup_updates"],
-            settings["save_per_updates"],
-            settings["last_per_steps"],
-            settings["finetune"],
-            settings["file_checkpoint_train"],
-            settings["tokenizer_type"],
-            settings["tokenizer_file"],
-            settings["mixed_precision"],
-            settings["logger"],
-            settings["bnb_optimizer"],
-        )
+    else:
+        with open(file_setting, "r") as f:
+            settings = json.load(f)
+            if "logger" not in settings:
+                settings["logger"] = "wandb"
+            if "bnb_optimizer" not in settings:
+                settings["bnb_optimizer"] = False
+            if "keep_last_n_checkpoints" not in settings:
+                settings["keep_last_n_checkpoints"] = -1  # default to keep all checkpoints
+            if "last_per_updates" not in settings:  # patch for backward compatibility, with before f992c4e
+                settings["last_per_updates"] = settings["last_per_steps"] // settings["grad_accumulation_steps"]
 
-    with open(file_setting, "r") as f:
-        settings = json.load(f)
-        if "logger" not in settings:
-            settings["logger"] = "wandb"
-        if "bnb_optimizer" not in settings:
-            settings["bnb_optimizer"] = False
-    return (
-        settings["exp_name"],
-        settings["learning_rate"],
-        settings["batch_size_per_gpu"],
-        settings["batch_size_type"],
-        settings["max_samples"],
-        settings["grad_accumulation_steps"],
-        settings["max_grad_norm"],
-        settings["epochs"],
-        settings["num_warmup_updates"],
-        settings["save_per_updates"],
-        settings["last_per_steps"],
-        settings["finetune"],
-        settings["file_checkpoint_train"],
-        settings["tokenizer_type"],
-        settings["tokenizer_file"],
-        settings["mixed_precision"],
-        settings["logger"],
-        settings["bnb_optimizer"],
-    )
+    return settings
 
 
 # Load metadata
@@ -379,7 +348,8 @@ def start_training(
     epochs=11,
     num_warmup_updates=200,
     save_per_updates=400,
-    last_per_steps=800,
+    keep_last_n_checkpoints=-1,
+    last_per_updates=800,
     finetune=True,
     file_checkpoint_train="",
     tokenizer_type="pinyin",
@@ -438,18 +408,19 @@ def start_training(
         fp16 = ""
 
     cmd = (
-        f"accelerate launch {fp16} {file_train} --exp_name {exp_name} "
-        f"--learning_rate {learning_rate} "
-        f"--batch_size_per_gpu {batch_size_per_gpu} "
-        f"--batch_size_type {batch_size_type} "
-        f"--max_samples {max_samples} "
-        f"--grad_accumulation_steps {grad_accumulation_steps} "
-        f"--max_grad_norm {max_grad_norm} "
-        f"--epochs {epochs} "
-        f"--num_warmup_updates {num_warmup_updates} "
-        f"--save_per_updates {save_per_updates} "
-        f"--last_per_steps {last_per_steps} "
-        f"--dataset_name {dataset_name}"
+        f"accelerate launch {fp16} {file_train} --exp_name {exp_name}"
+        f" --learning_rate {learning_rate}"
+        f" --batch_size_per_gpu {batch_size_per_gpu}"
+        f" --batch_size_type {batch_size_type}"
+        f" --max_samples {max_samples}"
+        f" --grad_accumulation_steps {grad_accumulation_steps}"
+        f" --max_grad_norm {max_grad_norm}"
+        f" --epochs {epochs}"
+        f" --num_warmup_updates {num_warmup_updates}"
+        f" --save_per_updates {save_per_updates}"
+        f" --keep_last_n_checkpoints {keep_last_n_checkpoints}"
+        f" --last_per_updates {last_per_updates}"
+        f" --dataset_name {dataset_name}"
     )
 
     if finetune:
@@ -482,7 +453,8 @@ def start_training(
         epochs,
         num_warmup_updates,
         save_per_updates,
-        last_per_steps,
+        keep_last_n_checkpoints,
+        last_per_updates,
         finetune,
         file_checkpoint_train,
         tokenizer_type,
@@ -880,7 +852,7 @@ def calculate_train(
     learning_rate,
     num_warmup_updates,
     save_per_updates,
-    last_per_steps,
+    last_per_updates,
     finetune,
 ):
     path_project = os.path.join(path_data, name_project)
@@ -892,7 +864,7 @@ def calculate_train(
             max_samples,
             num_warmup_updates,
             save_per_updates,
-            last_per_steps,
+            last_per_updates,
             "project not found !",
             learning_rate,
         )
@@ -940,14 +912,14 @@ def calculate_train(
 
     num_warmup_updates = int(samples * 0.05)
     save_per_updates = int(samples * 0.10)
-    last_per_steps = int(save_per_updates * 0.25)
+    last_per_updates = int(save_per_updates * 0.25)
 
     max_samples = (lambda num: num + 1 if num % 2 != 0 else num)(max_samples)
     num_warmup_updates = (lambda num: num + 1 if num % 2 != 0 else num)(num_warmup_updates)
     save_per_updates = (lambda num: num + 1 if num % 2 != 0 else num)(save_per_updates)
-    last_per_steps = (lambda num: num + 1 if num % 2 != 0 else num)(last_per_steps)
-    if last_per_steps <= 0:
-        last_per_steps = 2
+    last_per_updates = (lambda num: num + 1 if num % 2 != 0 else num)(last_per_updates)
+    if last_per_updates <= 0:
+        last_per_updates = 2
 
     total_hours = hours
     mel_hop_length = 256
@@ -978,7 +950,7 @@ def calculate_train(
         max_samples,
         num_warmup_updates,
         save_per_updates,
-        last_per_steps,
+        last_per_updates,
         samples,
         learning_rate,
         int(epochs),
@@ -1530,7 +1502,7 @@ Skip this step if you have your dataset, raw.arrow, duration.json, and vocab.txt
 
         with gr.TabItem("Train Data"):
             gr.Markdown("""```plaintext 
-The auto-setting is still experimental. Please make sure that the epochs, save per updates, and last per steps are set correctly, or change them manually as needed.
+The auto-setting is still experimental. Please make sure that the epochs, save per updates, and last per updates are set correctly, or change them manually as needed.
 If you encounter a memory error, try reducing the batch size per GPU to a smaller number.
 ```""")
             with gr.Row():
@@ -1561,7 +1533,14 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
 
             with gr.Row():
                 save_per_updates = gr.Number(label="Save per Updates", value=300)
-                last_per_steps = gr.Number(label="Last per Steps", value=100)
+                keep_last_n_checkpoints = gr.Number(
+                    label="Keep Last N Checkpoints",
+                    value=-1,
+                    step=1,
+                    precision=0,
+                    info="-1: Keep all checkpoints, 0: Only save final model_last.pt, N>0: Keep last N checkpoints",
+                )
+                last_per_updates = gr.Number(label="Last per Updates", value=100)
 
             with gr.Row():
                 ch_8bit_adam = gr.Checkbox(label="Use 8-bit Adam optimizer")
@@ -1571,44 +1550,27 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 stop_button = gr.Button("Stop Training", interactive=False)
 
             if projects_selelect is not None:
-                (
-                    exp_namev,
-                    learning_ratev,
-                    batch_size_per_gpuv,
-                    batch_size_typev,
-                    max_samplesv,
-                    grad_accumulation_stepsv,
-                    max_grad_normv,
-                    epochsv,
-                    num_warmupv_updatesv,
-                    save_per_updatesv,
-                    last_per_stepsv,
-                    finetunev,
-                    file_checkpoint_trainv,
-                    tokenizer_typev,
-                    tokenizer_filev,
-                    mixed_precisionv,
-                    cd_loggerv,
-                    ch_8bit_adamv,
-                ) = load_settings(projects_selelect)
-                exp_name.value = exp_namev
-                learning_rate.value = learning_ratev
-                batch_size_per_gpu.value = batch_size_per_gpuv
-                batch_size_type.value = batch_size_typev
-                max_samples.value = max_samplesv
-                grad_accumulation_steps.value = grad_accumulation_stepsv
-                max_grad_norm.value = max_grad_normv
-                epochs.value = epochsv
-                num_warmup_updates.value = num_warmupv_updatesv
-                save_per_updates.value = save_per_updatesv
-                last_per_steps.value = last_per_stepsv
-                ch_finetune.value = finetunev
-                file_checkpoint_train.value = file_checkpoint_trainv
-                tokenizer_type.value = tokenizer_typev
-                tokenizer_file.value = tokenizer_filev
-                mixed_precision.value = mixed_precisionv
-                cd_logger.value = cd_loggerv
-                ch_8bit_adam.value = ch_8bit_adamv
+                settings = load_settings(projects_selelect)
+
+                exp_name.value = settings["exp_name"]
+                learning_rate.value = settings["learning_rate"]
+                batch_size_per_gpu.value = settings["batch_size_per_gpu"]
+                batch_size_type.value = settings["batch_size_type"]
+                max_samples.value = settings["max_samples"]
+                grad_accumulation_steps.value = settings["grad_accumulation_steps"]
+                max_grad_norm.value = settings["max_grad_norm"]
+                epochs.value = settings["epochs"]
+                num_warmup_updates.value = settings["num_warmup_updates"]
+                save_per_updates.value = settings["save_per_updates"]
+                keep_last_n_checkpoints.value = settings["keep_last_n_checkpoints"]
+                last_per_updates.value = settings["last_per_updates"]
+                ch_finetune.value = settings["finetune"]
+                file_checkpoint_train.value = settings["file_checkpoint_train"]
+                tokenizer_type.value = settings["tokenizer_type"]
+                tokenizer_file.value = settings["tokenizer_file"]
+                mixed_precision.value = settings["mixed_precision"]
+                cd_logger.value = settings["logger"]
+                ch_8bit_adam.value = settings["bnb_optimizer"]
 
             ch_stream = gr.Checkbox(label="Stream Output Experiment", value=True)
             txt_info_train = gr.Text(label="Info", value="")
@@ -1659,7 +1621,8 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     epochs,
                     num_warmup_updates,
                     save_per_updates,
-                    last_per_steps,
+                    keep_last_n_checkpoints,
+                    last_per_updates,
                     ch_finetune,
                     file_checkpoint_train,
                     tokenizer_type,
@@ -1682,7 +1645,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     learning_rate,
                     num_warmup_updates,
                     save_per_updates,
-                    last_per_steps,
+                    last_per_updates,
                     ch_finetune,
                 ],
                 outputs=[
@@ -1690,7 +1653,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     max_samples,
                     num_warmup_updates,
                     save_per_updates,
-                    last_per_steps,
+                    last_per_updates,
                     lb_samples,
                     learning_rate,
                     epochs,
@@ -1713,7 +1676,7 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                     epochs,
                     num_warmup_updates,
                     save_per_updates,
-                    last_per_steps,
+                    last_per_updates,
                     ch_finetune,
                     file_checkpoint_train,
                     tokenizer_type,
